@@ -9,14 +9,17 @@ ThreadPool::ThreadPool(size_t num_threads) : active_tasks_(0), stop_(false) {
                 {
                     std::unique_lock<std::mutex> lock(this->queue_mutex_);
 
+                    // Потік спить, доки пул не зупинять або в черзі не з'явиться нове завдання
                     this->cv_task_.wait(lock, [this]() {
                         return this->stop_ || !this->tasks_.empty();
                     });
 
+                    // Якщо пул зупинено і черга порожня — потік завершує свою роботу
                     if (this->stop_ && this->tasks_.empty()) {
                         return;
                     }
 
+                    // Витягуємо завдання з черги
                     task = std::move(this->tasks_.front());
                     this->tasks_.pop();
                 }
@@ -27,7 +30,7 @@ ThreadPool::ThreadPool(size_t num_threads) : active_tasks_(0), stop_(false) {
                     std::unique_lock<std::mutex> lock(this->wait_mutex);
                     --active_tasks_;
                     if (active_tasks_ == 0) {
-                        cv_wait_.notify_all();
+                        cv_wait_.notify_all(); // Будимо wait_done(), якщо всі задачі завершено
                     }
                 }
             }
@@ -35,19 +38,25 @@ ThreadPool::ThreadPool(size_t num_threads) : active_tasks_(0), stop_(false) {
     }
 }
 
+// Додавання нового завдання в пул
 void ThreadPool::enqueue(std::function<void()> task) {
+    // Спочатку збільшуємо лічильник активних завдань
     {
         std::unique_lock<std::mutex> lock(wait_mutex);
         ++active_tasks_;
     }
+
+    // Кладемо нове завдання в чергу
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
         tasks_.push(std::move(task));
     }
 
+    // Сповіщаємо один із вільних потоків, що з'явилась робота
     cv_task_.notify_one();
 }
 
+// Блокує викликний потік, поки всі активні задачі не закінчаться
 void ThreadPool::wait_done() {
     std::unique_lock<std::mutex> lock(wait_mutex);
     cv_wait_.wait(lock, [this]() {
@@ -55,6 +64,7 @@ void ThreadPool::wait_done() {
     });
 }
 
+// Повертає кількість робочих потоків
 size_t ThreadPool::size() const {
     return workers_.size();
 }
