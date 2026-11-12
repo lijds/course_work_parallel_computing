@@ -1,0 +1,10 @@
+data/
+data/*
+build/
+cmake-build-*/
+.git/
+.vscode/
+.idea/
+*.zip
+*.tar
+*.gz

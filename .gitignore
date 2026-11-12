@@ -1,0 +1,46 @@
+# Датасет та архіви
+data/
+*.zip
+*.tar
+*.gz
+*.7z
+
+# Артефакти збірки CMake та C++
+build/
+cmake-build-*/
+bin/
+
+# Скомпільовані бінарні файли
+*.exe
+*.out
+search_server
+search_cli
+
+# Об'єктні файли та бібліотеки
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+
+# Налагоджувальні файли
+*.pdb
+compile_commands.json
+
+# Docker та ваги моделей Ollama
+.ollama/
+ollama_data/
+
+# Налаштування редакторів коду (IDE)
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# Системні файли та логи
+.DS_Store
+Thumbs.db
+*.log
+*.tmp

@@ -1,0 +1,14 @@
+services:
+  search_server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: search_server
+    ports:
+      - "8080:8080"
+    volumes:
+      
+      - ./data:/app/data:ro
+    environment:
+      - DATASET_PATH=/app/data
+    restart: unless-stopped
