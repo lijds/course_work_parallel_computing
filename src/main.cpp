@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -18,7 +19,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// Розбиваємо текст запиту на окремі слова
+// Розбиваємо текст запиту на окремі слова за тими ж правилами, що й при індексації
 std::vector<std::string> tokenize_query(const std::string& text) {
     std::vector<std::string> tokens;
     std::string current;
@@ -124,12 +125,83 @@ std::string extract_snippet(const std::string& dataset_path,
     return fallback_snippet + "...";
 }
 
+// Перевірка доступності сервісу Ollama
+bool check_ollama_health(const std::string& ollama_host) {
+    httplib::Client cli(ollama_host);
+    cli.set_connection_timeout(1, 0);
+    cli.set_read_timeout(1, 0);
+    auto res = cli.Get("/api/tags");
+    return res && res->status == 200;
+}
+
+// Розширення пошукового запиту синонімами через Ollama (/api/generate).
+// Використовуємо м'ютекс, бо Ollama обробляє один запит за раз.
+std::vector<std::string> expand_query_with_ollama(const std::string& query,
+                                                   const std::string& ollama_host,
+                                                   const std::string& ollama_model,
+                                                   std::mutex& ollama_mutex) {
+    std::vector<std::string> terms = tokenize_query(query);
+    std::unordered_set<std::string> unique_terms(terms.begin(), terms.end());
+
+    // Стаємо в чергу до Ollama
+    std::lock_guard<std::mutex> lock(ollama_mutex);
+
+    httplib::Client cli(ollama_host);
+    cli.set_connection_timeout(3, 0);
+    cli.set_read_timeout(15, 0);
+
+    std::string prompt =
+        "Generate 5 single-word English search synonyms or closely related keywords for the query: \"" +
+        query + "\". Return ONLY comma-separated single words, no explanations, no numbering.";
+
+    json req_body = {
+        {"model", ollama_model},
+        {"prompt", prompt},
+        {"stream", false},
+        {"options", {
+            {"temperature", 0.3},
+            {"num_predict", 40}
+        }}
+    };
+
+    auto res = cli.Post("/api/generate", req_body.dump(), "application/json");
+    if (res && res->status == 200) {
+        try {
+            auto resp_json = json::parse(res->body);
+            if (resp_json.contains("response") && resp_json["response"].is_string()) {
+                std::string generated = resp_json["response"].get<std::string>();
+                auto extra_tokens = tokenize_query(generated);
+                for (const auto& tok : extra_tokens) {
+                    if (unique_terms.insert(tok).second) {
+                        terms.push_back(tok);
+                    }
+                    // Обмежуємо кількість доданих слів, щоб не розмивати релевантність
+                    if (terms.size() >= 10) break;
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[Ollama] JSON parse error: " << e.what() << std::endl;
+        }
+    } else {
+        std::cerr << "[Ollama] Request failed or timed out, falling back to original query." << std::endl;
+    }
+
+    return terms;
+}
+
 int main() {
     const char* env_path = std::getenv("DATASET_PATH");
     std::string dataset_path = env_path ? env_path : "./data";
+
+    const char* env_ollama_host = std::getenv("OLLAMA_HOST");
+    std::string ollama_host = env_ollama_host ? env_ollama_host : "http://ollama:11434";
+
+    const char* env_ollama_model = std::getenv("OLLAMA_MODEL");
+    std::string ollama_model = env_ollama_model ? env_ollama_model : "qwen2.5:1.5b";
+
     size_t default_threads = 6;
 
-    // Створюємо інвертований індекс на 256 шардів 
+    // Створюємо інвертований індекс на 256 шардів
     std::cout << "Initializing Inverted Index (256 shards)..." << std::endl;
     InvertedIndex index(256);
 
@@ -137,16 +209,22 @@ int main() {
     std::cout << "Pre-indexing dataset from: " << dataset_path
               << " with " << default_threads << " threads..." << std::endl;
     IndexingStats current_stats = DatasetIndexer::index_directory(dataset_path, index, default_threads);
-    std::mutex stats_mutex; // М'ютекс для безпечного оновлення статистики та переіндексації
+    std::mutex stats_mutex;  // М'ютекс для безпечного оновлення статистики та переіндексації
+    std::mutex ollama_mutex; // Черга синхронізації запитів до Ollama
 
     std::cout << "Dataset indexed: " << current_stats.documents_indexed << " docs, "
               << current_stats.total_terms << " terms in " << current_stats.time_ms << " ms." << std::endl;
 
     httplib::Server svr;
 
-    // Перевірка, що сервер живий 
-    svr.Get("/api/health", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(R"({"status": "ok", "ollama": false})", "application/json");
+    // Перевірка, що сервер живий і чи доступна Ollama
+    svr.Get("/api/health", [&ollama_host](const httplib::Request&, httplib::Response& res) {
+        bool ollama_ok = check_ollama_health(ollama_host);
+        json j = {
+            {"status", "ok"},
+            {"ollama", ollama_ok}
+        };
+        res.set_content(j.dump(), "application/json");
     });
 
     // Статистика останньої побудови індексу
@@ -190,8 +268,8 @@ int main() {
         res.set_content(j.dump(), "application/json");
     });
 
-    // Пошук за ключовими словами
-    svr.Post("/api/search", [&index, &dataset_path](const httplib::Request& req, httplib::Response& res) {
+    // Пошук (mode: "keyword" або "expanded" з використанням Ollama)
+    svr.Post("/api/search", [&index, &dataset_path, &ollama_host, &ollama_model, &ollama_mutex](const httplib::Request& req, httplib::Response& res) {
         auto start_time = std::chrono::high_resolution_clock::now();
 
         std::string query_str;
@@ -214,8 +292,11 @@ int main() {
             return;
         }
 
-        // Розбиваємо запит на слова і сумуємо частоту їх появи в документах
-        std::vector<std::string> terms = tokenize_query(query_str);
+        // Якщо обрано розширений режим — запитуємо синоніми в Ollama, інакше звичайна токенізація
+        std::vector<std::string> terms = (mode == "expanded" || mode == "llm")
+            ? expand_query_with_ollama(query_str, ollama_host, ollama_model, ollama_mutex)
+            : tokenize_query(query_str);
+
         std::unordered_map<std::string, double> doc_scores;
 
         for (const auto& term : terms) {
@@ -256,6 +337,7 @@ int main() {
 
         json response = {
             {"results", results_json},
+            {"expanded_terms", terms},
             {"time_ms", elapsed_ms}
         };
         res.set_content(response.dump(), "application/json");
