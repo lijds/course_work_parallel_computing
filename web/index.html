@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Parallel Search Engine</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 850px; margin: 40px auto; padding: 0 20px; background: #f8fafc; color: #0f172a; }
+        h1 { font-size: 1.6rem; margin-bottom: 20px; }
+        .search-box { display: flex; gap: 10px; margin-bottom: 20px; }
+        input[type="text"] { flex: 1; padding: 12px 14px; font-size: 1rem; border: 1px solid #cbd5e1; border-radius: 8px; }
+        button { padding: 12px 20px; font-size: 1rem; background: #2563eb; color: white; border: none; border-radius: 8px; cursor: pointer; }
+        button:hover { background: #1d4ed8; }
+        .pipeline { display: flex; gap: 12px; margin-bottom: 20px; }
+        .stage { flex: 1; padding: 10px 14px; border-radius: 8px; background: #e2e8f0; color: #475569; font-weight: 500; text-align: center; transition: 0.2s; }
+        .stage.active { background: #fef08a; color: #854d0e; }
+        .stage.done { background: #bbf7d0; color: #166534; }
+        .terms-box { background: #fff; border: 1px solid #e2e8f0; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; display: none; }
+        .tag { display: inline-block; background: #dbeafe; color: #1e40af; padding: 3px 9px; border-radius: 999px; font-size: 0.85rem; margin: 3px 4px 3px 0; }
+        .meta { color: #64748b; font-size: 0.9rem; margin-bottom: 12px; }
+        .result-card { background: #fff; border: 1px solid #e2e8f0; padding: 16px; border-radius: 8px; margin-bottom: 12px; }
+        .result-header { display: flex; justify-content: space-between; margin-bottom: 8px; font-weight: 600; }
+        .doc-id { color: #2563eb; }
+        .score { color: #059669; font-size: 0.9rem; }
+        .snippet { color: #334155; font-size: 0.95rem; line-height: 1.5; }
+    </style>
+</head>
+<body>
+    <h1>Parallel Search Engine (Inverted Index + Ollama)</h1>
+
+    <div class="search-box">
+        <input type="text" id="queryInput" placeholder="Enter your search query (e.g., space exploration)..." />
+        <button id="searchBtn" onclick="startSearch()">Search (WS)</button>
+    </div>
+
+    <div class="pipeline">
+        <div id="st-expansion" class="stage">1. Query Expansion (LLM)</div>
+        <div id="st-search" class="stage">2. Keyword Search</div>
+        <div id="st-done" class="stage">3. Done</div>
+    </div>
+
+    <div id="termsBox" class="terms-box">
+        <strong>Expanded terms:</strong> <span id="termsList"></span>
+    </div>
+
+    <div id="metaInfo" class="meta"></div>
+    <div id="resultsList"></div>
+
+    <script>
+        const input = document.getElementById("queryInput");
+        input.addEventListener("keypress", (e) => { if (e.key === "Enter") startSearch(); });
+
+        function resetStages() {
+            ["st-expansion", "st-search", "st-done"].forEach(id => {
+                document.getElementById(id).className = "stage";
+            });
+            document.getElementById("termsBox").style.display = "none";
+            document.getElementById("resultsList").innerHTML = "";
+            document.getElementById("metaInfo").textContent = "";
+        }
+
+        function startSearch() {
+            const query = input.value.trim();
+            if (!query) return;
+
+            resetStages();
+            document.getElementById("st-expansion").classList.add("active");
+
+            const ws = new WebSocket(`ws://${window.location.hostname}:8081/ws/search`);
+
+            ws.onopen = () => {
+                ws.send(JSON.stringify({ query }));
+            };
+
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+
+                if (msg.stage === "query_expansion") {
+                    document.getElementById("st-expansion").className = "stage done";
+                    document.getElementById("st-search").classList.add("active");
+
+                    const terms = msg.data.expanded_terms || [];
+                    document.getElementById("termsList").innerHTML = terms
+                        .map(t => `<span class="tag">${t}</span>`).join("");
+                    document.getElementById("termsBox").style.display = "block";
+                } 
+                else if (msg.stage === "keyword_search") {
+                    document.getElementById("st-search").className = "stage done";
+                    const results = msg.data.results || [];
+                    document.getElementById("metaInfo").textContent =
+                        `Found top-${results.length} documents in ${msg.data.time_ms} ms`;
+
+                    document.getElementById("resultsList").innerHTML = results.map(r => `
+                        <div class="result-card">
+                            <div class="result-header">
+                                <span class="doc-id">${r.doc_id}</span>
+                                <span class="score">Score: ${r.score}</span>
+                            </div>
+                            <div class="snippet">${r.snippet}</div>
+                        </div>
+                    `).join("");
+                } 
+                else if (msg.stage === "done") {
+                    document.getElementById("st-done").className = "stage done";
+                    ws.close();
+                }
+            };
+
+            ws.onerror = () => {
+                document.getElementById("metaInfo").textContent = "WebSocket connection error (ws://localhost:8081/ws/search)";
+            };
+        }
+    </script>
+</body>
+</html>
