@@ -13,7 +13,7 @@ COPY . .
 
 RUN mkdir -p build && cd build && \
     cmake -DCMAKE_BUILD_TYPE=Release .. && \
-    cmake --build . --target search_server -j$(nproc)
+    cmake --build . -j$(nproc)
 
 FROM ubuntu:24.04
 
@@ -24,5 +24,6 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 COPY --from=builder /app/build/search_server /app/search_server
+COPY --from=builder /app/build/search /app/search
 
 CMD ["/app/search_server"]

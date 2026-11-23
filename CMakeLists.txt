@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+# 1. Основний сервер
 add_executable(search_server
     src/main.cpp
     src/thread_pool.cpp
@@ -16,3 +17,11 @@ add_executable(search_server
 
 target_include_directories(search_server PRIVATE src)
 target_link_libraries(search_server PRIVATE Threads::Threads OpenSSL::Crypto)
+
+# 2. CLI-клієнт
+add_executable(search
+    cli/search.cpp
+)
+
+target_include_directories(search PRIVATE src)
+target_link_libraries(search PRIVATE Threads::Threads)
