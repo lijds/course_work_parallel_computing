@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 add_executable(search_server
     src/main.cpp
@@ -14,4 +15,4 @@ add_executable(search_server
 )
 
 target_include_directories(search_server PRIVATE src)
-target_link_libraries(search_server PRIVATE Threads::Threads)
+target_link_libraries(search_server PRIVATE Threads::Threads OpenSSL::Crypto)

@@ -9,12 +9,14 @@
 #include <chrono>
 #include <cctype>
 #include <mutex>
+#include <thread>
 #include <filesystem>
 
 #include "httplib.h"
 #include "json.hpp"
 #include "inverted_index.h"
 #include "dataset_indexer.h"
+#include "ws_server.h"
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -41,8 +43,7 @@ std::vector<std::string> tokenize_query(const std::string& text) {
     return tokens;
 }
 
-// Шукаємо перший точний збіг слова у файлі та вирізаємо шматок тексту навколо нього.
-// Читаємо порціями по 16 КБ, щоб не вантажити весь файл у пам'ять одразу.
+// Потоково вирізаємо уривок тексту навколо першого точного збігу слова
 std::string extract_snippet(const std::string& dataset_path,
                             const std::string& doc_id,
                             const std::vector<std::string>& terms) {
@@ -52,8 +53,8 @@ std::string extract_snippet(const std::string& dataset_path,
         return "";
     }
 
-    const size_t CHUNK_SIZE = 16384; // 16 КБ за одне читання
-    const size_t OVERLAP = 64;      // залишаємо хвіст попереднього блоку, щоб не розрізати слово на стику
+    const size_t CHUNK_SIZE = 16384;
+    const size_t OVERLAP = 64;
     std::string buffer;
     std::string chunk(CHUNK_SIZE, '\0');
     std::string fallback_snippet;
@@ -66,7 +67,6 @@ std::string extract_snippet(const std::string& dataset_path,
 
         buffer.append(chunk, 0, bytes_read);
 
-        // Запам'ятовуємо початок файлу про всяк випадок, якщо слово не знайдеться
         if (is_first_chunk) {
             fallback_snippet = buffer.substr(0, std::min<size_t>(160, buffer.size()));
             is_first_chunk = false;
@@ -80,7 +80,6 @@ std::string extract_snippet(const std::string& dataset_path,
         for (const auto& term : terms) {
             size_t pos = 0;
             while ((pos = lower_buf.find(term, pos)) != std::string::npos) {
-                // Перевіряємо, що це окреме слово, а не частина іншого (напр. "war" у "forward")
                 bool left_ok = (pos == 0) || !std::isalpha(static_cast<unsigned char>(lower_buf[pos - 1]));
                 bool right_ok = (pos + term.size() >= lower_buf.size()) ||
                                 !std::isalpha(static_cast<unsigned char>(lower_buf[pos + term.size()]));
@@ -95,13 +94,11 @@ std::string extract_snippet(const std::string& dataset_path,
             }
         }
 
-        // Якщо знайшли слово і після нього ще є трохи тексту для контексту — формуємо сніпет і виходимо
         if (best_pos != std::string::npos && (best_pos + 110 <= buffer.size() || file.eof())) {
             size_t start = (best_pos > 50) ? (best_pos - 50) : 0;
             size_t len = std::min<size_t>(160, buffer.size() - start);
             std::string snippet = buffer.substr(start, len);
 
-            // Прибираємо переноси рядків і табуляцію, щоб JSON виглядав охайно
             for (char& c : snippet) {
                 if (c == '\r' || c == '\n' || c == '\t') {
                     c = ' ';
@@ -111,7 +108,6 @@ std::string extract_snippet(const std::string& dataset_path,
                    (start + len < buffer.size() || !file.eof() ? "..." : "");
         }
 
-        // Відкидаємо вже перевірений текст, залишаючи тільки перекриття
         if (buffer.size() > OVERLAP) {
             buffer.erase(0, buffer.size() - OVERLAP);
         }
@@ -134,8 +130,7 @@ bool check_ollama_health(const std::string& ollama_host) {
     return res && res->status == 200;
 }
 
-// Розширення пошукового запиту синонімами через Ollama (/api/generate).
-// Використовуємо м'ютекс, бо Ollama обробляє один запит за раз.
+// Розширення запиту синонімами через Ollama (/api/generate) із чергою на м'ютексі
 std::vector<std::string> expand_query_with_ollama(const std::string& query,
                                                    const std::string& ollama_host,
                                                    const std::string& ollama_model,
@@ -143,7 +138,6 @@ std::vector<std::string> expand_query_with_ollama(const std::string& query,
     std::vector<std::string> terms = tokenize_query(query);
     std::unordered_set<std::string> unique_terms(terms.begin(), terms.end());
 
-    // Стаємо в чергу до Ollama
     std::lock_guard<std::mutex> lock(ollama_mutex);
 
     httplib::Client cli(ollama_host);
@@ -175,7 +169,6 @@ std::vector<std::string> expand_query_with_ollama(const std::string& query,
                     if (unique_terms.insert(tok).second) {
                         terms.push_back(tok);
                     }
-                    // Обмежуємо кількість доданих слів, щоб не розмивати релевантність
                     if (terms.size() >= 10) break;
                 }
             }
@@ -187,6 +180,45 @@ std::vector<std::string> expand_query_with_ollama(const std::string& query,
     }
 
     return terms;
+}
+
+// Спільна функція пошуку за списком токенів для REST та WebSocket
+json execute_keyword_search(InvertedIndex& index,
+                            const std::string& dataset_path,
+                            const std::vector<std::string>& terms) {
+    std::unordered_map<std::string, double> doc_scores;
+
+    for (const auto& term : terms) {
+        auto postings = index.get_postings(term);
+        for (const auto& p : postings) {
+            doc_scores[p.doc_id] += static_cast<double>(p.term_frequency);
+        }
+    }
+
+    std::vector<SearchResult> results;
+    results.reserve(doc_scores.size());
+    for (const auto& [doc_id, score] : doc_scores) {
+        results.push_back({doc_id, score, ""});
+    }
+
+    std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
+        return a.score > b.score;
+    });
+
+    if (results.size() > 10) {
+        results.resize(10);
+    }
+
+    json results_json = json::array();
+    for (auto& r : results) {
+        r.snippet = extract_snippet(dataset_path, r.doc_id, terms);
+        results_json.push_back({
+            {"doc_id", r.doc_id},
+            {"score", r.score},
+            {"snippet", r.snippet}
+        });
+    }
+    return results_json;
 }
 
 int main() {
@@ -201,23 +233,77 @@ int main() {
 
     size_t default_threads = 6;
 
-    // Створюємо інвертований індекс на 256 шардів
     std::cout << "Initializing Inverted Index (256 shards)..." << std::endl;
     InvertedIndex index(256);
 
-    // Одразу індексуємо датасет при запуску сервера
     std::cout << "Pre-indexing dataset from: " << dataset_path
               << " with " << default_threads << " threads..." << std::endl;
     IndexingStats current_stats = DatasetIndexer::index_directory(dataset_path, index, default_threads);
-    std::mutex stats_mutex;  // М'ютекс для безпечного оновлення статистики та переіндексації
-    std::mutex ollama_mutex; // Черга синхронізації запитів до Ollama
+    std::mutex stats_mutex;
+    std::mutex ollama_mutex;
 
     std::cout << "Dataset indexed: " << current_stats.documents_indexed << " docs, "
               << current_stats.total_terms << " terms in " << current_stats.time_ms << " ms." << std::endl;
 
+    // Запускаємо WebSocket-сервер (/ws/search) на порту 8081 у фоновому потоці
+    std::thread ws_thread([&index, &dataset_path, &ollama_host, &ollama_model, &ollama_mutex]() {
+        start_ws_server(8081, [&](int client_fd, const std::string& raw_msg) {
+            std::string query_str;
+            try {
+                auto body = json::parse(raw_msg);
+                if (!body.contains("query") || !body["query"].is_string()) {
+                    ws_send_text(client_fd, json({{"error", "Missing 'query' field"}}).dump());
+                    return;
+                }
+                query_str = body["query"].get<std::string>();
+            } catch (const std::exception&) {
+                ws_send_text(client_fd, json({{"error", "Invalid JSON"}}).dump());
+                return;
+            }
+
+            // Етап 1: query_expansion через Ollama
+            std::vector<std::string> expanded_terms =
+                expand_query_with_ollama(query_str, ollama_host, ollama_model, ollama_mutex);
+
+            json stage1 = {
+                {"stage", "query_expansion"},
+                {"data", {
+                    {"original", query_str},
+                    {"expanded_terms", expanded_terms}
+                }}
+            };
+            if (!ws_send_text(client_fd, stage1.dump())) return;
+
+            // Етап 2: keyword_search по інвертованому індексу
+            auto search_start = std::chrono::high_resolution_clock::now();
+            json results_json = execute_keyword_search(index, dataset_path, expanded_terms);
+            auto search_end = std::chrono::high_resolution_clock::now();
+            auto search_ms = std::chrono::duration_cast<std::chrono::milliseconds>(search_end - search_start).count();
+
+            json stage2 = {
+                {"stage", "keyword_search"},
+                {"data", {
+                    {"results", results_json},
+                    {"time_ms", search_ms}
+                }}
+            };
+            if (!ws_send_text(client_fd, stage2.dump())) return;
+
+            // Етап 3: завершення пайплайну
+            json stage3 = {
+                {"stage", "done"}
+            };
+            ws_send_text(client_fd, stage3.dump());
+        });
+    });
+    ws_thread.detach();
+
     httplib::Server svr;
 
-    // Перевірка, що сервер живий і чи доступна Ollama
+    // Роздаємо статичні файли для Web UI з папки ./web
+    svr.set_mount_point("/", "./web");
+
+    // GET /api/health
     svr.Get("/api/health", [&ollama_host](const httplib::Request&, httplib::Response& res) {
         bool ollama_ok = check_ollama_health(ollama_host);
         json j = {
@@ -227,7 +313,7 @@ int main() {
         res.set_content(j.dump(), "application/json");
     });
 
-    // Статистика останньої побудови індексу
+    // GET /api/stats
     svr.Get("/api/stats", [&current_stats, &stats_mutex](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::mutex> lock(stats_mutex);
         json j = {
@@ -238,7 +324,7 @@ int main() {
         res.set_content(j.dump(), "application/json");
     });
 
-    // Перебудова індексу з нуля на вказаній кількості потоків
+    // POST /api/index
     svr.Post("/api/index", [&index, &dataset_path, &current_stats, &stats_mutex](const httplib::Request& req, httplib::Response& res) {
         size_t threads = 4;
         try {
@@ -255,7 +341,6 @@ int main() {
             return;
         }
 
-        // Блокуємо, щоб два запити одночасно не почали чистити й перебудовувати індекс
         std::lock_guard<std::mutex> lock(stats_mutex);
         index.clear();
         current_stats = DatasetIndexer::index_directory(dataset_path, index, threads);
@@ -268,7 +353,7 @@ int main() {
         res.set_content(j.dump(), "application/json");
     });
 
-    // Пошук (mode: "keyword" або "expanded" з використанням Ollama)
+    // POST /api/search
     svr.Post("/api/search", [&index, &dataset_path, &ollama_host, &ollama_model, &ollama_mutex](const httplib::Request& req, httplib::Response& res) {
         auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -292,45 +377,11 @@ int main() {
             return;
         }
 
-        // Якщо обрано розширений режим — запитуємо синоніми в Ollama, інакше звичайна токенізація
         std::vector<std::string> terms = (mode == "expanded" || mode == "llm")
             ? expand_query_with_ollama(query_str, ollama_host, ollama_model, ollama_mutex)
             : tokenize_query(query_str);
 
-        std::unordered_map<std::string, double> doc_scores;
-
-        for (const auto& term : terms) {
-            auto postings = index.get_postings(term);
-            for (const auto& p : postings) {
-                doc_scores[p.doc_id] += static_cast<double>(p.term_frequency);
-            }
-        }
-
-        // Перекладаємо у вектор і сортуємо за релевантністю (від більшого до меншого)
-        std::vector<SearchResult> results;
-        results.reserve(doc_scores.size());
-        for (const auto& [doc_id, score] : doc_scores) {
-            results.push_back({doc_id, score, ""});
-        }
-
-        std::sort(results.begin(), results.end(), [](const SearchResult& a, const SearchResult& b) {
-            return a.score > b.score;
-        });
-
-        // Беремо тільки топ-10 результатів і витягуємо для них сніпети
-        if (results.size() > 10) {
-            results.resize(10);
-        }
-
-        json results_json = json::array();
-        for (auto& r : results) {
-            r.snippet = extract_snippet(dataset_path, r.doc_id, terms);
-            results_json.push_back({
-                {"doc_id", r.doc_id},
-                {"score", r.score},
-                {"snippet", r.snippet}
-            });
-        }
+        json results_json = execute_keyword_search(index, dataset_path, terms);
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();

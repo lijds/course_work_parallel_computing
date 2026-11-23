@@ -7,6 +7,7 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     restart: unless-stopped
+
   search_server:
     build:
       context: .
@@ -14,16 +15,16 @@ services:
     container_name: search_server
     ports:
       - "8080:8080"
+      - "8081:8081"
     volumes:
-      
       - ./data:/app/data:ro
+      - ./web:/app/web:ro
     environment:
       - DATASET_PATH=/app/data
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_MODEL=qwen2.5:1.5b
     depends_on:
       - ollama
-
     restart: unless-stopped
 
 volumes:
